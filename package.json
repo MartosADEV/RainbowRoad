@@ -1,0 +1,14 @@
+{
+  "name": "rainbow-road-safety-car",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "13kB game jam entry - endless runner where you are the Health & Safety officer of Rainbow Road",
+  "scripts": {
+    "build": "node build.mjs",
+    "serve": "node serve.mjs"
+  },
+  "devDependencies": {
+    "terser": "^5.36.0"
+  }
+}

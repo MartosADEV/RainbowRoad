@@ -1,0 +1,1025 @@
+/* RAINBOW ROAD: SAFETY CAR — 13kB jam entry
+   You are the Health & Safety officer preparing Rainbow Road before the racers arrive.
+
+   Everything renders into a 480x270 pixel buffer that is blitted to the 960x540
+   display canvas with smoothing off. That single indirection is what makes the
+   whole game read as pixel art: sprites, text and particles are all authored in
+   buffer pixels, never in screen pixels. */
+(() => {
+'use strict';
+
+// ---------------------------------------------------------------- constants
+const W = 480, H = 270, CX = W / 2;
+const HZY = 85;             // horizon line
+const BOT = 220;            // (buffer y at z=0) - HZY
+const CAM = 17;             // camera depth: scale = CAM/(z+CAM)
+const RW = 200;             // road half-width in px at z=0
+const LSP = 125;            // lane spacing in px at z=0
+const PLZ = 8.5;            // z the player car sits at
+// SAFETY is a rolling average, not a point tally: every hazard resolution
+// pulls it toward a target (mitigate=100, avoid=40, ignore=10, collide=0) by
+// this fraction. It starts neutral at 50 and IS the number the final report
+// grades you on — no separate hidden metric, so the live bar never lies.
+const EMA = .14, T_MIT = 100, T_AVOID = 40, T_IGN = 10, T_HIT = 0;
+const SPZ = 118;            // z where hazards spawn
+const SPU = 26;             // world units per second at speed 1
+const SEG = 3.2, NSEG = 40; // road bands
+const K = 3.3;              // sprite pixels per unit of perspective scale
+
+const dsp = document.getElementById('c');       // 960x540, what the player sees
+const dc = dsp.getContext('2d');
+const cv = document.createElement('canvas');    // 480x270 pixel buffer
+cv.width = W; cv.height = H;
+const cx = cv.getContext('2d');
+dc.imageSmoothingEnabled = cx.imageSmoothingEnabled = false;
+
+// hazard tables: 0 banana 1 oil 2 shell 3 barrier 4 sign 5 bob-omb 6 road damage
+const HN = 'BANANA/OIL SPILL/SHELL/BROKEN BARRIER/MISSING SIGN/BOB-OMB/ROAD DAMAGE/SAFETY VEST/RACER KART/ITEM BOX/EMPTY ITEM SLOT'.split('/');
+const VERB = 'CLEAN/REMOVE/REPAIR/SIGNAL/RESTOCK'.split('/');
+const HV = [0, 0, 1, 2, 3, 1, 2, 0, 1, 0, 4]; // which verb per hazard
+const HS = [1, 2, 3, 2, 1, 5, 3, 0, 4, 0, 2]; // severity
+const HD = [1, 1, 1, 1, 0, 1, 1, 0, 1, 0, 0]; // does it cause an accident on contact
+// types 0-6 are hazards you can service. 7-9 are neither cleanable nor ignorable.
+const VEST = 7;                         // pickup
+const RACER = 8;                        // moving obstacle, closes faster than the world
+const BOX = 9;                          // item box: driving into it forces a speed mushroom
+const SLOT = 10;                        // the gap in a box row — restock it for credit
+const MUSHT = 7;                        // seconds a mushroom keeps you too fast to work
+// serviceable with E: every real hazard, plus the empty slot you can restock
+const fixable = ty => ty < 7 || ty === SLOT;
+const WT = '000000111122233344456';     // spawn weights (GDD §40)
+const HARD = '2356';                    // difficulty bias pool
+
+const RANK = 'CIRCUIT CLOSED/NON-COMPLIANT/AT RISK/ACCEPTABLE/EXCELLENT'.split('/');
+const RMSG = 'ABSOLUTELY NOT./PLEASE CONTACT OHS IMMEDIATELY./MANAGEMENT HAS QUESTIONS./SOME CORRECTIVE ACTIONS REQUIRED./OUTSTANDING COMPLIANCE.'.split('/');
+const CAUSE = 'INSUFFICIENT HAZARD CONTROL/INADEQUATE RISK ASSESSMENT/EXCESSIVE OPTIMISM/FAILURE TO SIGNAL/SPEED OVER SAFETY'.split('/');
+const EVT = 'BANANA SPILL DETECTED/PROJECTILE HAZARD/EMERGENCY MAINTENANCE/IMMEDIATE ACTION REQUIRED/RACER APPROACHING'.split('/');
+const EVH = [0, 2, 3, 5, 4];            // hazard type forced by each event
+
+// briefing cards: headline | line | line
+const BRIEF = ('THIS IS YOU.|OHS SAFETY OFFICER, GRADE 2|PROVISIONAL CONTRACT./' +
+  'YOUR MISSION|MAKE RAINBOW ROAD SAFE BEFORE|THE KART RACERS ARRIVE./' +
+  'GOOD LUCK.|YOUR JOB IS ON THE LINE.|MANAGEMENT IS WATCHING.').split('/');
+
+// ---------------------------------------------------------------- state
+let st = 3;          // 3 briefing, 0 menu, 1 playing, 2 game over
+let page = 0;        // briefing card, 0-2
+let t = 0;           // elapsed seconds (for animation)
+let dist, spd, diff, safety, score, combo, bestCombo;
+let best = 0; try { best = +localStorage.rrsc || 0; } catch (e) { }
+let lane, lx, brk, braking, shk, inv, shield, mush;
+let hz, par, spawnT, evT, evN, evK, evMsg, boxT;
+let insp, inspT, inspSeen, inspOk, verdict, verdT;
+let seen, mit, ign, acc, boxed;
+let toast, toastT, incident, incT, lock;
+
+function reset() {
+  dist = 0; spd = 1; diff = 1; safety = 50; score = 0; combo = 0; bestCombo = 0;
+  lane = 1; lx = 1; brk = 1; braking = 0; shk = 0; inv = 0; shield = 0; mush = 0;
+  hz = []; par = []; spawnT = .6; evT = 12; evN = 0; evK = 0; evMsg = 0; boxT = 16;
+  insp = 0; inspT = 0; inspSeen = 0; inspOk = 0; verdict = -1; verdT = 0;
+  seen = 0; mit = 0; ign = 0; acc = 0; boxed = 0;
+  toast = 0; toastT = 0; incident = -1; incT = 0; lock = 0;
+}
+reset();
+
+// ---------------------------------------------------------------- audio
+let ac;
+function snd(f, d, type, v, f2) {
+  if (!ac) return;
+  const o = ac.createOscillator(), g = ac.createGain(), n = ac.currentTime;
+  o.type = type; o.frequency.setValueAtTime(f, n);
+  if (f2) o.frequency.exponentialRampToValueAtTime(f2, n + d);
+  g.gain.setValueAtTime(v, n);
+  g.gain.exponentialRampToValueAtTime(.0001, n + d);
+  o.connect(g); g.connect(ac.destination); o.start(n); o.stop(n + d + .02);
+}
+
+// Two-voice arpeggio over a four-bar chord progression, with the arp figure and
+// timbre swapping every four bars: 64 steps (~10s) before anything repeats.
+let mute = 0, mt = 0, mstep = 0;
+const NOTE = [0, 7, 3, 10, 5, 12, 3, 7];
+const NOT2 = [0, 5, 12, 7, 15, 10, 3, 8];
+const CHORD = [0, -4, 5, -2];
+function music(dt) {
+  if (mute || !ac) return;
+  mt -= dt;
+  if (mt > 0) return;
+  mt = insp === 2 ? .118 : .155;             // inspections tighten the tempo
+  const step = mstep & 7, sec = mstep >> 5 & 1;
+  const root = CHORD[mstep >> 3 & 3] - (insp === 2 ? 5 : 0);
+  const n = (sec ? NOT2 : NOTE)[step] + root + (sec && step === 6 ? 12 : 0);
+  const f = 220 * Math.pow(2, n / 12);
+  // a triangle carries far less energy than a square at equal gain, so the B
+  // section has to be compensated or it drops out of the mix entirely
+  snd(f, .13, sec ? 'triangle' : 'square', sec ? .032 : .017, f * 1.5);
+  // bass sits at 87-147Hz: an octave lower is inaudible on laptop/phone speakers
+  if (!(mstep & 3)) snd(110 * Math.pow(2, root / 12), .22, 'triangle', .05);
+  if ((mstep & 15) === 14) snd(1500, .04, 'square', .009, 2400);
+  mstep++;
+}
+
+// ---------------------------------------------------------------- input
+const k = {};
+function press(c) {
+  if (!ac) try { ac = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { }
+  if (st === 3) { if (++page > 2) st = 0; snd(560, .07, 'square', .05, 780); return; }
+  if (incident >= 0) { if (incT < 2.2) incident = -1; return; }
+  if (st !== 1) { if (lock <= 0) { reset(); st = 1; } return; }
+  if (c === 0 && lane > 0) { lane--; snd(400, .06, 'square', .05, 540); }
+  if (c === 1 && lane < 2) { lane++; snd(400, .06, 'square', .05, 540); }
+  if (c === 2) act();
+}
+onkeydown = e => {
+  const c = e.code;
+  if (!k[c]) {
+    if (c === 'KeyA' || c === 'ArrowLeft') press(0);
+    else if (c === 'KeyD' || c === 'ArrowRight') press(1);
+    else if (c === 'KeyE' || c === 'ShiftLeft' || c === 'ShiftRight') press(2);
+    else if (c === 'KeyM') mute ^= 1;
+    else press(9);
+  }
+  k[c] = 1;
+  if (c.indexOf('Arrow') === 0 || c === 'Space') e.preventDefault();
+};
+onkeyup = e => k[e.code] = 0;
+
+// Touch devices get swipe-to-steer plus two sticky buttons; mice keep the
+// simpler tap-zones, which are fine with a cursor but useless with a thumb.
+const MOB = matchMedia('(pointer:coarse)').matches || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+const BTN_E = [6, 190, 52, 34], BTN_B = [6, 228, 52, 34];
+let ptr = 0, tapE = 0;
+const tch = {};                                   // live pointers, keyed by pointerId
+
+function bxy(e) {
+  const r = dsp.getBoundingClientRect();
+  return [(e.clientX - r.left) / r.width * W, (e.clientY - r.top) / r.height * H];
+}
+function inB(x, y, b) { return x > b[0] && x < b[0] + b[2] && y > b[1] && y < b[1] + b[3]; }
+
+dsp.onpointerdown = e => {
+  const p = bxy(e), x = p[0], y = p[1];
+  try { dsp.setPointerCapture(e.pointerId); } catch (q) { }
+  if (st !== 1 || incident >= 0) { press(9); return; }
+  if (MOB) {
+    if (inB(x, y, BTN_E)) { tch[e.pointerId] = { m: 1 }; tapE = .12; press(2); return; }
+    if (inB(x, y, BTN_B)) { tch[e.pointerId] = { m: 2 }; ptr = 1; return; }
+    tch[e.pointerId] = { m: 0, x };               // anywhere else starts a swipe
+    return;
+  }
+  if (y > H * .78) { ptr = 1; return; }
+  press(x < W * .34 ? 0 : x > W * .66 ? 1 : 2);
+};
+dsp.onpointermove = e => {
+  const c = tch[e.pointerId];
+  if (!c || c.m) return;
+  const x = bxy(e)[0], d = x - c.x;
+  if (Math.abs(d) > 26) { press(d < 0 ? 0 : 1); c.x = x; }   // repeatable swipe
+};
+dsp.onpointerup = dsp.onpointercancel = e => {
+  const c = tch[e.pointerId];
+  if (!c || c.m === 2) ptr = 0;
+  delete tch[e.pointerId];
+};
+
+// ---------------------------------------------------------------- projection
+function sc(z) { return CAM / (z + CAM); }
+let bend = 0, hill = 0;
+function curve(s) { const q = (1 - s) * (1 - s); return [bend * q * 490, hill * q * 150]; }
+function px(l, z) { const s = sc(z), c = curve(s); return [CX + c[0] + (l - 1) * LSP * s, HZY + BOT * s - c[1], s]; }
+
+// ---------------------------------------------------------------- gameplay
+function act() {
+  let bi = -1, bt = 9;
+  for (let i = 0; i < hz.length; i++) {
+    const h = hz[i];
+    if (h.d || h.lane !== lane || !fixable(h.t)) continue;
+    const tti = (h.z - PLZ) / (spd * SPU);
+    if (tti > .04 && tti < .58 && tti < bt) { bt = tti; bi = i; }
+  }
+  if (bi < 0) { snd(150, .08, 'sawtooth', .035, 110); return; }   // swing and a miss
+  const h = hz[bi], sv = HS[h.t], slot = h.t === SLOT;
+  h.d = 1; combo++; if (combo > bestCombo) bestCombo = combo;
+  if (slot) boxed++; else mit++;
+  if (insp === 2 && !slot) inspOk++;
+  safety += (T_MIT - safety) * EMA;
+  const gain = (60 + sv * 34) * (1 + Math.min(combo, 25) * .1);   // clamped, §17
+  score += gain;
+  toast = slot ? 'ITEM BOX RESTOCKED' : VERB[HV[h.t]] === 'REPAIR' ? 'HAZARD REPAIRED' : 'HAZARD REMOVED';
+  toastT = 1.3; toast += '|+' + (gain | 0);
+  const p = px(h.lane, h.z);
+  burst(p[0], p[1], 10, slot ? 190 : 60 + h.t * 42, p[2]);
+  snd(620 + Math.min(combo, 12) * 45, .11, 'triangle', .06, 1080 + combo * 60);
+  if (combo && combo % 5 === 0) snd(900, .2, 'sine', .05, 1500);
+}
+
+function burst(x, y, n, hue, s) {
+  for (let i = 0; i < n && par.length < 30; i++)
+    par.push({ x, y, vx: (Math.random() - .5) * 130 * s, vy: (Math.random() - .8) * 110 * s, l: .5 + Math.random() * .4, h: hue + Math.random() * 40, r: 1 + (2 * s | 0) });
+}
+
+function spawn(force) {
+  // one row: 1-2 blocked lanes, never all three (GDD §24)
+  const n = force >= 0 ? 1 : (diff > 2.2 && Math.random() < Math.min(.4, diff * .06)) ? 2 : 1;
+  const free = Math.random() * 3 | 0;
+  let lanes = [0, 1, 2].filter(l => l !== free);
+  for (let i = 0; i < n; i++) {
+    const l = lanes.splice(Math.random() * lanes.length | 0, 1)[0];
+    let ty = force >= 0 ? force : +WT[Math.random() * WT.length | 0];
+    if (force < 0 && Math.random() < Math.min(.34, diff * .06)) ty = +HARD[Math.random() * 4 | 0];
+    hz.push({ t: ty, lane: l, z: SPZ + i * 2, d: 0 });
+    seen++;
+  }
+  // an inspection is scored per row: one lane is all you can physically service
+  if (insp === 2) inspSeen++;
+  // safety vest drops in a clear lane (GDD §25)
+  if (force < 0 && !shield && Math.random() < .05 && !hz.some(h => h.t === VEST))
+    hz.push({ t: VEST, lane: free, z: SPZ + 6, d: 0 });
+}
+
+// A row of item boxes with exactly one lane missing its box. Sitting in the gap
+// and pressing E restocks it for credit; driving into either box forces a
+// mushroom on you, which is a penalty here — speed is the enemy of paperwork.
+// Spawned well beyond the normal spawn line so every hazard already in flight
+// resolves before the row arrives — otherwise a stray shell shares the gap lane
+// and the "go to the empty lane" read falls apart.
+function spawnBoxes() {
+  const gap = Math.random() * 3 | 0;
+  for (let l = 0; l < 3; l++)
+    hz.push({ t: l === gap ? SLOT : BOX, lane: l, z: SPZ + 40, d: 0 });
+}
+
+function crash(h) {
+  const p0 = px(h.lane, h.z);
+  if (shield) {                              // PPE absorbs it, no paperwork
+    shield = 0; inv = 1.1; shk = 6;
+    toast = 'VEST ABSORBED IMPACT|NO PAPERWORK FILED'; toastT = 1.4;
+    burst(p0[0], p0[1], 12, 170, 1);
+    snd(300, .25, 'square', .08, 90);
+    return;
+  }
+  acc++; combo = 0; inv = 1.2; shk = 13; spd = Math.max(1, spd * .55);
+  const fatal = h.t === 5;
+  // a bob-omb is a "major accident" that ends the run outright (GDD §11.6/§33),
+  // regardless of Safety — but the fatal hit itself does NOT drag the average
+  // down first: the report grades the run you played, not the explosion that
+  // ended it. A pull-to-0 here would cap every bomb death under ~86%, making
+  // EXCELLENT structurally unreachable no matter how well you'd been playing.
+  // Non-fatal collisions still pull the average down, same as any other miss.
+  if (!fatal) safety += (T_HIT - safety) * EMA;
+  burst(p0[0], p0[1], 16, 20, 1);
+  snd(90, .4, 'sawtooth', .12, 40);
+  incident = h.t; incT = 3.2;
+  if ((safety | 0) <= 0 || fatal) over();
+}
+
+function over() {
+  safety = Math.max(0, safety);
+  st = 2; incident = -1; lock = .8;
+  if (score > best) { best = score | 0; try { localStorage.rrsc = best; } catch (e) { } }
+  snd(400, .7, 'sawtooth', .09, 60);
+}
+
+function bandIdx(v) { return v >= 90 ? 4 : v >= 75 ? 3 : v >= 50 ? 2 : v >= 25 ? 1 : 0; }
+
+// ---------------------------------------------------------------- update
+function update(dt) {
+  t += dt;
+  if (lock > 0) lock -= dt;
+  if (shk > 0) shk -= shk * dt * 7;
+  for (let i = par.length; i--;) {
+    const p = par[i];
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 210 * dt; p.l -= dt;
+    if (p.l <= 0) par.splice(i, 1);
+  }
+  if (st !== 1) return;
+  music(dt);
+  if (incident >= 0) { incT -= dt; if (incT <= 0) incident = -1; return; } // world frozen for the report
+
+  // --- speed & brake
+  braking = (k.Space || ptr) && brk > .04 ? 1 : 0;
+  brk = Math.max(0, Math.min(1, brk + (braking ? -.42 : .3) * dt));
+  const boost = (k.KeyW || k.ArrowUp) ? 1.24 : 1;
+  const base = 1 + Math.min(2.2, dist / 1600);
+  if (mush > 0) mush -= dt;
+  // braking still cuts you back to a workable pace, so the brake is the counter-play
+  // to a mushroom rather than something you just have to sit out
+  spd += ((braking ? base * .45 : base * boost * (mush > 0 ? 1.45 : 1)) - spd) * Math.min(1, dt * 5);
+  dist += spd * SPU * dt;
+  diff = Math.min(6, 1 + dist / 1100);
+  score += dt * spd * 42 * (1 + Math.min(combo, 25) * .05);
+  if (inv > 0) inv -= dt;
+
+  // --- road shape
+  bend = Math.sin(dist * .0016) * .26 + Math.sin(dist * .00061) * .16;
+  hill = Math.sin(dist * .0009) * .5;
+  lx += (lane - lx) * Math.min(1, dt * 14);
+
+  // --- inspection cycle (GDD §19/§20)
+  inspT -= dt;
+  if (!insp && inspT <= 0 && dist > 700) {
+    insp = 1; inspT = 2.4; snd(760, .12, 'square', .06); snd(980, .12, 'square', .05);
+  } else if (insp === 1 && inspT <= 0) {
+    insp = 2; inspT = 13; inspSeen = 0; inspOk = 0;
+  } else if (insp === 2 && inspT <= 0) {
+    insp = 0; inspT = 26;
+    const r = inspSeen ? inspOk / inspSeen * 100 : 100;
+    verdict = r >= 90 ? 3 : r >= 70 ? 2 : r >= 50 ? 1 : 0; verdT = 3.4;
+    // no extra Safety nudge here: the hazards mitigated/missed during the
+    // inspection already moved the rolling average, same as any other row
+    snd(verdict > 1 ? 700 : 220, .3, 'triangle', .06, verdict > 1 ? 1200 : 140);
+  }
+  if (verdT > 0) verdT -= dt;
+
+  // --- random events (GDD §22)
+  evT -= dt;
+  if (evT <= 0 && !evN && insp !== 2) {
+    evK = Math.random() * 5 | 0; evN = evK === 4 ? 0 : 4 + (Math.random() * 3 | 0);
+    evMsg = 2.6; evT = 15 + Math.random() * 14;
+    // a racer is an actual kart bearing down one lane, not just a warning
+    if (evK === 4) hz.push({ t: RACER, lane: Math.random() * 3 | 0, z: SPZ + 70, d: 0 });
+    snd(evK === 3 || evK === 4 ? 300 : 560, .18, 'square', .05, evK === 3 ? 180 : 760);
+  }
+  if (evMsg > 0) evMsg -= dt;
+
+  // --- item box rows, kept clear of inspections so the two never overlap
+  boxT -= dt;
+  if (boxT <= 0 && insp !== 2 && !hz.some(h => h.t >= BOX)) {
+    spawnBoxes(); boxT = 20 + Math.random() * 10;
+    snd(880, .1, 'square', .045, 1320);
+  }
+
+  // --- spawning
+  spawnT -= dt;
+  if (spawnT <= 0) {
+    // hold new rows back while a kart or a box row is in play, so their lanes are
+    // never the only way out and the box row arrives as its own clean beat
+    if (hz.some(h => (h.t === RACER && h.z < 78) || h.t >= BOX)) spawnT = .3;
+    else if (evN > 0) { spawn(EVH[evK]); evN--; spawnT = .3 + Math.random() * .12; }
+    else { spawn(-1); spawnT = Math.max(.42, 1.05 - diff * .12) * (insp === 2 ? .68 : 1); }
+  }
+
+  // --- hazards
+  const mv = spd * SPU * dt;
+  for (let i = hz.length; i--;) {
+    const h = hz[i];
+    const step = h.t === RACER ? mv * 1.8 : mv;    // the kart closes on you
+    if (h.t === RACER && h.z >= 26 && h.z - step < 26) snd(340, .5, 'sawtooth', .07, 90);
+    h.z -= step;
+    if (!h.d && h.z <= PLZ && h.z > PLZ - step - 1 && h.lane === lane) {
+      if (h.t === VEST) {                    // picked up
+        h.d = 1; shield = 1;
+        toast = 'SAFETY VEST ISSUED|ONE FREE INCIDENT'; toastT = 1.6;
+        const p = px(h.lane, h.z); burst(p[0], p[1], 10, 170, 1);
+        snd(520, .18, 'sine', .07, 1040);
+        continue;
+      }
+      if (h.t === BOX) {                     // drove into a box: forced mushroom
+        h.d = 1; mush = MUSHT;
+        toast = 'MUSHROOM TAKEN|SLOW DOWN'; toastT = 1.6;
+        const p = px(h.lane, h.z); burst(p[0], p[1], 12, 0, 1);
+        snd(700, .22, 'square', .06, 1500);
+        continue;
+      }
+      if (HD[h.t] && inv <= 0) { h.d = 2; crash(h); continue; }
+    }
+    if (h.z < PLZ - 7) {
+      if (!h.d && h.t < 7) {
+        // left in your own lane = ignored (§14). Left in another lane = merely avoided:
+        // pulls Safety toward a less severe target, and it does not break the combo.
+        const own = h.lane === lane;
+        ign++;
+        if (own) combo = 0;
+        safety += ((own ? T_IGN : T_AVOID) - safety) * EMA;
+        if ((safety | 0) <= 0) { over(); return; }
+      }
+      hz.splice(i, 1);
+    }
+  }
+  if (toastT > 0) toastT -= dt;
+}
+
+// ================================================================ PIXEL FONT
+// 5x7 glyphs. One base-32 digit per row = the 5 bits of that row, MSB leftmost.
+const CH = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,:'!?-+/%()[]*^~<>\"";
+const FONT =                                     // 5 glyphs per line, CH order
+  'ehhvhhhuhhuhhufgggggfuhhhhhuvgguggv' +        // A B C D E
+  'vggugggfggjhhehhhvhhhv44444v72222ic' +        // F G H I J
+  'hikokihggggggvhrlhhhhhpljhhhehhhhhe' +        // K L M N O
+  'uhhugggehhhliduhhukihfgge11uv444444' +        // P Q R S T
+  'hhhhhhehhhhha4hhhhllahha4ahhhha4444' +        // U V W X Y
+  'v1248gvehjlphe4c4444eeh1248vv2421he' +        // Z 0 1 2 3
+  '26aiv22vgu11he68guhhev124888ehhehhe' +        // 4 5 6 7 8
+  'ehhf12c000000000000cc00000c80cc0cc0' +        // 9 _ . , :
+  '44000004444404eh12404000v000044v440' +        // ' ! ? - +
+  '11248ggpp248jj48ggg844211124e88888e' +        // / % ( ) [
+  'e22222e44veeah44aalhv0124k80048v840' +        // ] * ^ ~ <
+  '042v240aa00000';                              // > "
+
+const GL = [];
+for (let i = 0; i < CH.length; i++) {
+  const a = [];
+  for (let r = 0; r < 7; r++) a.push(parseInt(FONT[i * 7 + r], 32));
+  GL.push(a);
+}
+
+function tw(s, z) { return s.length * 6 * z - z; }
+
+// al: 0 left, 1 centre, 2 right
+function txt(s, x, y, z, col, al) {
+  s = ('' + s).toUpperCase();
+  const w = tw(s, z);
+  x = Math.round(al === 1 ? x - w / 2 : al === 2 ? x - w : x);
+  y = Math.round(y);
+  cx.fillStyle = col;
+  for (let i = 0; i < s.length; i++) {
+    const g = GL[CH.indexOf(s[i])];
+    if (!g) continue;
+    for (let r = 0; r < 7; r++) {
+      const b = g[r];
+      if (!b) continue;
+      for (let c = 0; c < 5; c++)
+        if (b >> (4 - c) & 1) cx.fillRect(x + (i * 6 + c) * z, y + r * z, z, z);
+    }
+  }
+  return w;
+}
+
+// ================================================================ SPRITES
+// Each sprite is one string of palette indices ('0' = transparent), baked once
+// into an offscreen canvas so per-frame drawing is a single scaled drawImage.
+function bake(w, pal, d) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = d.length / w;
+  const g = c.getContext('2d');
+  for (let i = 0; i < d.length; i++) {
+    // '0'-'9' index 0-9, then 'A' onward for 10+ so palettes can exceed ten entries
+    const q = d.charCodeAt(i), v = q < 58 ? q - 48 : q - 55;
+    if (!v) continue;
+    g.fillStyle = pal[v - 1];
+    g.fillRect(i % w, (i / w) | 0, 1, 1);
+  }
+  return c;
+}
+
+const CARD =
+  '00000555556666600000' +
+  '00004444444444440000' +
+  '00022222222222222000' +
+  '00022444444444422000' +
+  '00022444444444422000' +
+  '00022222222222222000' +
+  '00222222222222222200' +
+  '00333333333333333300' +
+  '00992222222222229900' +
+  '00222222222222222200' +
+  '00777777777777777700' +
+  '00777777888877777700' +
+  '44441111111111114444' +
+  '44441111111111114444' +
+  '04400000000000000440';
+const CP = ['#0a0d16', '#e6e9f2', '#ff8a1e', '#141a2b', '#ff3040', '#20306a', '#8a92a8', '#d8dce8', '#c81828'];
+const CP2 = CP.slice(); CP2[4] = '#6a1420'; CP2[5] = '#3a6aff';
+const CAR = [bake(20, CP, CARD), bake(20, CP2, CARD)];
+
+// hazards, indexed by type; VEST is index 7
+const SPR = [
+  // open peel: stalk on top, body, three flaps sweeping out to brown tips
+  bake(24, ['#ffe14a', '#e0b820', '#7a3f10', '#fff8c0'],
+    '000000000003300000000000' + '000000000001100000000000' + '000000000011110000000000' +
+    '000000000144111000000000' + '000000000144112000000000' + '000000001111112200000000' +
+    '000000001111112200000000' + '000000001111112200000000' + '000000001111112200000000' +
+    '000000111111112222000000' + '000011111111112222222000' + '001111100011110002222200' +
+    '011110000011110000022220' + '331100000011110000002233' + '000000000013310000000000'),
+  bake(14, ['#12101c', '#4a2a7a'],
+    '00011111100000' + '00111221111000' + '01112211111100' +
+    '11111111111110' + '01111111111100' + '00011111110000'),
+  bake(12, ['#1ee06a', '#0fa050', '#f2f2e0'],
+    '000011110000' + '000111111000' + '001111111100' + '011122211110' +
+    '111222222111' + '111222222111' + '133333333331' + '033333333330' + '003333333300'),
+  bake(16, ['#e63030', '#f0f0f0', '#8a92a8'],
+    '1122112211000000' + '1122112211000000' + '1122112211000000' + '0000000000000000' +
+    '0003300000003300' + '0003300000003300' + '0003300000003300' + '0003300000003300' +
+    '0033330000333300'),
+  bake(10, ['#7a7a8a', '#ffd23a'],
+    '0000220000' + '0002002000' + '0002002000' + '0020000200' + '0020000200' +
+    '0200000020' + '2222222222' + '0000110000' + '0000110000' + '0000110000' + '0001111000'),
+  bake(12, ['#0d0d16', '#f0f0f0', '#c9a300', '#ff9020'],
+    '000000004400' + '000000033000' + '000000330000' + '000003300000' +
+    '000111111000' + '001111111100' + '011111111110' + '011221122110' +
+    '011221122110' + '011111111110' + '011111111110' + '001111111100' + '000111111000'),
+  bake(16, ['#0a0812', '#ffb020'],
+    '0000011111100000' + '0001111111111000' + '0211111111111120' +
+    '2111111111111112' + '0211111111111120' + '0011111111110000'),
+  bake(12, ['#ff9020', '#f2f2f2'],
+    '001100001100' + '001100001100' + '011110011110' + '011111111110' +
+    '011111111110' + '022222222220' + '011111111110' + '011111111110' +
+    '022222222220' + '011111111110' + '011111111110' + '001111111100'),
+  // racer kart, head on: helmet, shoulders, chassis, tyres, headlights
+  bake(20, ['#e02828', '#8f1414', '#141a2b', '#f2c07a', '#f0f0f0', '#ffd23a'],
+    '00000000555500000000' + '00000005555550000000' + '00000005444450000000' +
+    '00000011111111000000' + '00000111111111100000' + '00000111111122200000' +
+    '00011111111111222000' + '33330111111122203333' + '33330111111122203333' +
+    '33332222222222223333' + '33332662222226623333' + '33330000000000003333' +
+    '03330000000000003330'),
+  // item box: four colour quadrants behind a white question mark
+  bake(14, ['#ff5aa0', '#ffd23a', '#3ef08a', '#2ad0ff', '#f4fbff', '#1a6fd0'],
+    '66666666666666' + '61111112222226' + '61111112222226' + '61111155522226' +
+    '61111512252226' + '61111112252226' + '61111112522226' + '64444445333336' +
+    '64444445333336' + '64444443333336' + '64444445333336' + '64444443333336' +
+    '64444443333336' + '66666666666666')
+];
+
+//LOGO
+
+// speed mushroom, shown riding on the roof while its timer runs
+const MUSH = bake(12, ['#e03030', '#f8f8f8', '#2a2a3a'],
+  '000011110000' + '001111111100' + '011111111110' + '122111111221' +
+  '122112211221' + '111112211111' + '111111111111' + '000222222000' +
+  '000232232000' + '000222222000');
+
+// 7x7 HUD icons
+const ICO = [
+  bake(7, ['#ffd23a', '#a07000'], '0011100' + '0122210' + '1211121' + '1211121' + '1211121' + '0122210' + '0011100'),
+  bake(7, ['#3ef08a', '#186a40'], '1111111' + '1222221' + '1222221' + '0122210' + '0012100' + '0012100' + '0001000'),
+  bake(7, ['#ff6a20', '#ffd23a'], '0001000' + '0011100' + '0111110' + '1112111' + '1122211' + '1122211' + '0111110'),
+  bake(7, ['#59b6ff', '#0d1a2a'], '0111110' + '1122211' + '1211121' + '1211121' + '1211121' + '1122211' + '0111110'),
+  bake(7, ['#e63030', '#8a92a8'], '0211110' + '0211110' + '0211110' + '0200000' + '0200000' + '0200000' + '0200000')
+];
+
+// per-type render scale, so a wide sprite does not read as a bigger hazard
+// per-type render scale — must cover every type up to SLOT or the sprite
+// scales by undefined and silently disappears
+const HSC = [.7, 1, 1, 1, 1, 1, 1, 1, 1.3, 1.25, 1];
+
+// The player, for the intro cards. 24x46, drawn at integer scale 3.
+const OFFICER = bake(24, ['#1a2035', '#2c3552', '#e6b083', '#c08c5e', '#6b4526', '#ffd23a', '#0c0e16', '#9fc4e8', '#4a5570'],
+  '000000000555555000000000' + '000000005555555500000000' + '000000005555555500000000' +
+  '000000005533335500000000' + '000000005333333500000000' + '000000005373373500000000' +
+  '000000005333333500000000' + '000000005334433500000000' + '000000005533335500000000' +
+  '000000005557755500000000' + '000000000555555000000000' + '000000000055550000000000' +
+  '000000000044440000000000' + '000000022221122220000000' + '000002222221122222200000' +
+  '000026222222112222620000' + '000022222282282622220000' + '000022299228822992220000' +
+  '000022299228822992220000' + '000022222228822222220000' + '000022222222222222220000' +
+  '000022222222222222222200' + '000022222222222222222333' + '000022222222222222222300' +
+  '000033222222222222220000' + '000002222222222222200000' + '000007777777777777700000' +
+  '000007777776677777700000' + '000007799777777997700000' + '000000111111111111000000' +
+  '000077111111111111000000' + '000000111110011111000000' + '000000111110011111000000' +
+  '000000111110011111000000' + '000000111110011111000000' + '000000111110011111000000' +
+  '000000111110011111000000' + '000000111110011111000000' + '000000111110011111000000' +
+  '000000111110011111000000' + '000000111100001111000000' + '000000111100001111000000' +
+  '000007777770077777700000' + '000007777770077777700000' + '000077777770077777770000' +
+  '000077777770077777770000');
+
+function spr(img, x, y, z) {            // anchored centre-bottom
+  const w = Math.max(1, Math.round(img.width * z)), h = Math.max(1, Math.round(img.height * z));
+  cx.drawImage(img, Math.round(x - w / 2), Math.round(y - h), w, h);
+}
+
+// ================================================================ BACKGROUND
+// 50% checkerboard patterns give the sky its dithered banding for ~0 bytes.
+function mkPat(col) {
+  const c = document.createElement('canvas'); c.width = c.height = 2;
+  const g = c.getContext('2d'); g.fillStyle = col;
+  g.fillRect(0, 0, 1, 1); g.fillRect(1, 1, 1, 1);
+  return cx.createPattern(c, 'repeat');
+}
+const SKY = ['#06021a', '#0e0730', '#1b0b46', '#2c1060', '#431679'];
+const SKYP = SKY.map(mkPat);
+const GLOWP = ['#5e1f9c', '#8a35c8', '#b45ce8'].map(mkPat);
+
+const VP = HZY + 26;        // where the road actually vanishes on screen
+const stars = [];
+for (let i = 0; i < 80; i++) stars.push({ x: Math.random() * W, y: Math.random() * H, p: Math.random() * 6 });
+
+// x, y, radius, hue, has ring — kept clear of the HUD corners
+const PLANETS = [[44, 156, 12, 140, 0], [404, 54, 9, 30, 1], [458, 132, 6, 200, 0], [300, 26, 4, 12, 0], [186, 40, 3, 280, 0]];
+const SQ = [0, 1, 2, 3, 4, 3, 2, 1, 0];                 // sky band colour indices
+const SY = [0, 17, 34, 51, 68, 85, 100, 118, 140];      // and where each starts
+
+function planet(x, y, r, hue, ring) {
+  for (let dy = -r; dy <= r; dy++) {
+    const w = Math.sqrt(r * r - dy * dy) | 0;
+    if (!w) continue;
+    // flat two-tone shading: lit upper-left, dark lower-right
+    cx.fillStyle = 'hsl(' + hue + ',48%,32%)';
+    cx.fillRect(x - w, y + dy, w * 2 + 1, 1);
+    const lw = (w * (dy < 0 ? .8 : .45)) | 0;
+    if (lw > 0) { cx.fillStyle = 'hsl(' + hue + ',52%,46%)'; cx.fillRect(x - w, y + dy, lw, 1); }
+  }
+  if (ring) {
+    cx.fillStyle = 'hsl(' + hue + ',60%,62%)';
+    for (let a = 0; a < 6.3; a += .09)
+      cx.fillRect(x + Math.cos(a) * r * 1.9 | 0, y + Math.sin(a) * r * .55 | 0, 1, 1);
+  }
+}
+
+function bg() {
+  // space brightens toward the horizon then falls away again, seams dithered
+  for (let i = 0; i < 9; i++) {
+    cx.fillStyle = SKY[SQ[i]];
+    cx.fillRect(0, SY[i], W, (SY[i + 1] || H) - SY[i] + 1);
+  }
+  for (let i = 0; i < 8; i++) {
+    const h = Math.min(9, (SY[i + 1] - SY[i]) * .55) | 0;
+    cx.fillStyle = SKYP[SQ[i + 1]];
+    cx.fillRect(0, SY[i + 1] - h, W, h);
+  }
+
+  const sx = bend * 30;
+  cx.fillStyle = '#fff';
+  for (const s of stars) {
+    if (Math.sin(t * 1.4 + s.p) < -.55) continue;   // twinkle
+    cx.fillRect((s.x - sx + W * 2) % W | 0, s.y | 0, 1, 1);
+  }
+  for (const p of PLANETS) planet((p[0] - sx + W * 2) % W | 0, p[1], p[2], p[3], p[4]);
+
+}
+
+// dithered haze exactly where the road disappears, so it never ends in a visible stub
+function fog() {
+  const f = px(1, NSEG * SEG), x = f[0], y = f[1];
+  for (let i = 0; i < 3; i++) {
+    cx.fillStyle = GLOWP[i];
+    cx.beginPath(); cx.ellipse(x, y, 46 - i * 14, 9 - i * 3, 0, 0, 7); cx.fill();
+  }
+  cx.fillStyle = '#9a45d8';
+  cx.beginPath(); cx.ellipse(x, y, 15, 2, 0, 0, 7); cx.fill();
+}
+
+// ================================================================ ROAD
+function quad(x0, y0, w0, x1, y1, w1, col) {
+  cx.fillStyle = col; cx.beginPath();
+  cx.moveTo(x0 - w0, y0); cx.lineTo(x0 + w0, y0); cx.lineTo(x1 + w1, y1); cx.lineTo(x1 - w1, y1);
+  cx.fill();
+}
+
+const GRID = [-.84, -.5, -.16, .16, .5, .84];   // dark column lines, fraction of RW
+const RAIL = ['#2ad0ff', '#7dffc4'];
+
+function road() {
+  const base = dist % SEG;
+  for (let i = NSEG; i--;) {
+    const z0 = i * SEG - base, z1 = z0 + SEG;
+    if (z1 <= 0) continue;
+    const n = Math.floor((dist + z0) / SEG);
+    const a = px(1, Math.max(0, z0)), b = px(1, z1);
+    const w0 = RW * a[2], w1 = RW * b[2];
+    const hue = (n * 31) % 360, lit = n & 1 ? 46 : 36;
+    quad(a[0], a[1], w0, b[0], b[1], w1, 'hsl(' + hue + ',88%,' + lit + '%)');
+
+    if (a[2] > .17) {                            // tile grid, near half only
+      for (const f of GRID)
+        quad(a[0] + f * w0, a[1], w0 * .012, b[0] + f * w1, b[1], w1 * .012, 'rgba(0,0,0,.34)');
+    }
+    if (n & 1) {                                 // lane dividers, dashed
+      for (const d of [-1, 1]) {
+        const q0 = a[0] + d * LSP * .5 * a[2], q1 = b[0] + d * LSP * .5 * b[2];
+        quad(q0, a[1], w0 * .028, q1, b[1], w1 * .028, '#fff');
+      }
+    }
+    for (const d of [-1, 1]) {                   // neon rails, fixed colours so they read as edges
+      const q0 = a[0] + d * (RW + 9) * a[2], q1 = b[0] + d * (RW + 9) * b[2];
+      quad(q0, a[1], w0 * .08, q1, b[1], w1 * .08, RAIL[n & 1]);
+    }
+  }
+}
+
+// ================================================================ ACTORS
+function hazard(h) {
+  const p = px(h.lane, h.z), x = p[0], y = p[1], z = p[2] * K;
+  if (h.d || y < HZY || z < .2) return;          // handled hazards vanish
+  if (h.t === SLOT) {                            // the gap: a dashed ghost outline
+    const w = 7 * z, hh = 14 * z, d = Math.max(1, z | 0);
+    cx.fillStyle = (t * 5 | 0) & 1 ? '#7dffc4' : '#2f8f70';
+    for (let a = -w; a <= w; a += 3) {           // top and bottom edges
+      cx.fillRect(Math.round(x + a), Math.round(y - hh), d, d);
+      cx.fillRect(Math.round(x + a), Math.round(y), d, d);
+    }
+    for (let b = -hh; b <= 0; b += 3) {          // left and right edges
+      cx.fillRect(Math.round(x - w), Math.round(y + b), d, d);
+      cx.fillRect(Math.round(x + w), Math.round(y + b), d, d);
+    }
+  } else {
+    if (h.t === VEST) {                          // pulsing halo under the pickup
+      cx.fillStyle = 'rgba(60,255,200,' + (.16 + .12 * Math.sin(t * 8)) + ')';
+      cx.beginPath(); cx.ellipse(x, y - 6 * z, 9 * z, 4 * z, 0, 0, 7); cx.fill();
+    }
+    spr(SPR[h.t], x, y, z * HSC[h.t]);
+  }
+  // blinking marshal flag over an inbound kart, so its lane is telegraphed early
+  if (h.t === RACER && h.z > 30)
+    spr(ICO[4], x, y - (SPR[RACER].height + 4) * z, Math.max(1, Math.round(z * 1.4)));
+  if (h.t === 5) {                               // bob-omb fuse spark
+    cx.fillStyle = (t * 20 | 0) & 1 ? '#fff2a0' : '#ff9020';
+    cx.fillRect(Math.round(x + 3 * z), Math.round(y - SPR[5].height * z), Math.max(1, z | 0), Math.max(1, z | 0));
+  }
+  // dotted action-window ring
+  const tti = (h.z - PLZ) / (spd * SPU);
+  if (h.lane === lane && fixable(h.t) && tti > .04 && tti < .58 && (t * 8 | 0) & 1) {
+    cx.fillStyle = '#7dffc4';
+    for (let a = 0; a < 6.3; a += .5)
+      cx.fillRect(Math.round(x + Math.cos(a) * 9 * z), Math.round(y - 1 + Math.sin(a) * 3.4 * z), 1, 1);
+  }
+}
+
+function car() {
+  const p = px(lx, PLZ), x = p[0], y = p[1], z = p[2] * K;
+  cx.fillStyle = 'rgba(0,0,0,.4)';
+  cx.beginPath(); cx.ellipse(x, y - 1, 11 * z, 3 * z, 0, 0, 7); cx.fill();
+  if (inv > 0 && (t * 12 | 0) & 1) return;       // blink while invulnerable
+  spr(CAR[(t * 7 | 0) & 1], x, y, z);
+  if (braking) {
+    cx.fillStyle = '#ff5a4a';
+    const w = Math.round(3 * z), hgt = Math.max(1, Math.round(2 * z));
+    cx.fillRect(Math.round(x - 9 * z), Math.round(y - 7 * z), w, hgt);
+    cx.fillRect(Math.round(x + 6 * z), Math.round(y - 7 * z), w, hgt);
+  }
+  // mushroom riding on the roof with its countdown, so the speed penalty is
+  // always attributable to something visible rather than feeling like drift
+  if (mush > 0) {
+    const my = Math.round(y - 19 * z);
+    spr(MUSH, x - 7, my, 1.4);
+    txt(Math.ceil(mush) + 'S', x + 4, my - 12, 1, (t * 6 | 0) & 1 || mush > 2 ? '#fff' : '#ff6a4a', 0);
+  }
+}
+
+// ================================================================ UI
+function bar(x, y, n, v, col) {
+  for (let i = 0; i < n; i++) {
+    cx.fillStyle = (i + .5) / n <= v ? col : '#252b3d';
+    cx.fillRect(x + i * 7, y, 6, 5);
+  }
+}
+
+function panel(x, y, w, h, edge) {
+  cx.fillStyle = 'rgba(6,3,18,.88)'; cx.fillRect(x, y, w, h);
+  cx.fillStyle = edge;
+  cx.fillRect(x, y, w, 1); cx.fillRect(x, y + h - 1, w, 1);
+  cx.fillRect(x, y, 1, h); cx.fillRect(x + w - 1, y, 1, h);
+}
+
+function tbtn(b, big, sub, on) {
+  cx.fillStyle = on ? 'rgba(125,255,196,.26)' : 'rgba(6,3,18,.66)';
+  cx.fillRect(b[0], b[1], b[2], b[3]);
+  cx.fillStyle = on ? '#7dffc4' : '#5d6784';
+  cx.fillRect(b[0], b[1], b[2], 1); cx.fillRect(b[0], b[1] + b[3] - 1, b[2], 1);
+  cx.fillRect(b[0], b[1], 1, b[3]); cx.fillRect(b[0] + b[2] - 1, b[1], 1, b[3]);
+  txt(big, b[0] + b[2] / 2, b[1] + 8, 2, on ? '#7dffc4' : '#e6ebf8', 1);
+  txt(sub, b[0] + b[2] / 2, b[1] + 24, 1, '#8f8fb0', 1);
+}
+
+function key(s, x, y) {
+  const w = tw(s, 1) + 5;
+  cx.fillStyle = '#4a5168'; cx.fillRect(x, y - 2, w, 11);
+  cx.fillStyle = '#2a2f3f'; cx.fillRect(x, y + 8, w, 1);
+  txt(s, x + 3, y + 1, 1, '#eef0f8', 0);
+  return w;
+}
+
+function hud() {
+  spr(ICO[0], 11, 15, 1);
+  txt('SCORE ' + String(score | 0).padStart(6, '0'), 18, 8, 1, '#fff', 0);
+  txt((dist | 0) + 'M', W - 8, 8, 1, '#fff', 2);
+
+  const rows = [['SAFETY', safety / 100, safety > 74 ? '#3ef08a' : safety > 40 ? '#ffd23a' : '#ff4646'],
+  ['SPEED', (spd - 1) / 2.6, '#c07bff'],
+  ['BRAKE', brk, braking ? '#fff' : '#59b6ff']];
+  rows.forEach((r, i) => {
+    const y = 20 + i * 11;
+    spr(ICO[i + 1], 11, y + 7, 1);
+    txt(r[0], 18, y, 1, '#9fe8ff', 0);
+    bar(56, y + 1, 10, r[1], r[2]);
+  });
+  txt((safety | 0) + '%', 130, 20, 1, '#fff', 0);
+  if (shield) txt('[ PPE ACTIVE ]', 18, 54, 1, '#3ef0c8', 0);
+  if (MOB) {
+    if (tapE > 0) tapE -= .02;
+    tbtn(BTN_E, 'E', 'FIX', tapE > 0);
+    tbtn(BTN_B, 'B', 'BRAKE', braking);
+  }
+
+  if (combo > 1) txt('SAFETY COMBO X' + combo, W - 8, 20, 1, 'hsl(' + (combo * 22 % 360) + ',100%,74%)', 2);
+
+  // contextual prompt
+  let np = null, nt = 9;
+  for (const h of hz) {
+    if (h.d || h.lane !== lane || !fixable(h.t)) continue;
+    const tti = (h.z - PLZ) / (spd * SPU);
+    if (tti > .04 && tti < .58 && tti < nt) { nt = tti; np = h; }
+  }
+  if (np) {
+    const slot = np.t === SLOT;
+    panel(CX - 84, 240, 168, 25, slot ? '#7dffc4' : '#ffe14a');
+    txt((slot ? '~ ' : '^ ') + HN[np.t], CX, 245, 1, slot ? '#7dffc4' : '#ffe14a', 1);
+    const vb = VERB[HV[np.t]], w = tw(vb, 1) + 20;
+    let x = CX - w / 2;
+    x += key('E', x, 256) + 4;
+    txt(vb, x, 257, 1, '#7dffc4', 0);
+  }
+
+  if (toastT > 0 && verdT <= 0) {
+    const p = toast.split('|'), a = '~ ' + p[0];
+    // a subtitle starting with '+' is a score award; anything else is literal copy
+    const b = p[1][0] === '+' ? p[1] + ' PTS' : p[1];
+    const w = Math.max(tw(a, 1), tw(b, 1)) + 14;
+    panel(CX - w / 2, 92, w, 24, '#7dffc4');
+    txt(a, CX, 96, 1, '#7dffc4', 1);
+    txt(b, CX, 106, 1, '#fff', 1);
+  }
+
+  if (insp === 1) banner('^ OHS INSPECTION INCOMING', '#ff4a4a', 'SECURE THE TRACK');
+  else if (insp === 2) {
+    banner('OHS INSPECTION ACTIVE  ' + Math.ceil(inspT) + 'S', '#ffd23a', inspOk + '/' + inspSeen + ' HAZARDS HANDLED');
+    if ((t * 4 | 0) & 1) {
+      cx.fillStyle = '#ff3c3c';
+      cx.fillRect(0, 0, W, 2); cx.fillRect(0, H - 2, W, 2);
+      cx.fillRect(0, 0, 2, H); cx.fillRect(W - 2, 0, 2, H);
+    }
+  }
+  else if (evMsg > 0) banner('^ ' + EVT[evK], evK > 2 ? '#ff4a4a' : '#ffd23a', evK === 4 ? 'SECURE THE TRACK' : '');
+
+  if (verdT > 0) {
+    const y = 130;
+    const r = ['CRITICAL NON-COMPLIANCE|CIRCUIT TEMPORARILY CLOSED', 'INSPECTION FAILED|CORRECTIVE ACTION REQUIRED',
+      'INSPECTION PASSED|WITH OBSERVATIONS', 'INSPECTION PASSED|EXCELLENT'][verdict].split('|');
+    const q = ['"BOWSER SAYS IT LOOKS FINE."', '"MANAGEMENT HAS BEEN NOTIFIED."',
+      '"PLEASE FIX THE BANANAS."', '"FINALLY, SOMEONE COMPETENT."'][verdict];
+    const col = verdict > 1 ? '#3ef08a' : '#ff4646';
+    panel(CX - 130, y, 260, 48, col);
+    txt(r[0], CX, y + 8, 1, col, 1);
+    txt(r[1], CX, y + 22, 1, '#fff', 1);
+    txt(q, CX, y + 34, 1, '#9fe8ff', 1);
+  }
+
+}
+
+function banner(s, col, sub) {
+  panel(CX - 112, 58, 224, sub ? 26 : 16, col);
+  txt(s, CX, 62, 1, col, 1);
+  if (sub) txt(sub, CX, 73, 1, '#fff', 1);
+}
+
+function incidentCard() {
+  cx.fillStyle = 'rgba(4,2,12,.9)'; cx.fillRect(0, 0, W, H);
+  const y = 44;
+  panel(CX - 118, y - 14, 236, 168, '#ff4a4a');
+  txt('INCIDENT REPORT', CX, y - 6, 2, '#ff4a4a', 1);
+  const L = [['TYPE', HN[incident] + '-RELATED INCIDENT'],
+  ['ROOT CAUSE', CAUSE[incident % 5]],
+  ['CORRECTIVE ACTION', VERB[HV[incident]] + ' ' + HN[incident]],
+  ['RESPONSIBLE PERSON', 'YOU'],
+  ['SAFETY PENALTY', '-' + (6 + HS[incident] * 2)]];
+  L.forEach((r, i) => {
+    txt(r[0], CX - 108, y + 16 + i * 22, 1, '#8f8fb0', 0);
+    txt(r[1], CX - 108, y + 26 + i * 22, 1, '#fff', 0);
+  });
+  if (incT < 2.2) txt(MOB ? '[ TAP TO CONTINUE ]' : '[ ANY KEY TO CONTINUE ]', CX, y + 138, 1, (t * 4 | 0) & 1 ? '#ffe14a' : '#7a6a20', 1);
+}
+
+// rainbow neon border, six nested 1px rings
+function neon(x, y, w, h) {
+  for (let i = 0; i < 6; i++) {
+    cx.fillStyle = 'hsl(' + ((t * 50 + i * 44) % 360) + ',100%,' + (56 + i * 3) + '%)';
+    const a = x - i, b = y - i, c = w + i * 2, d = h + i * 2;
+    cx.fillRect(a, b, c, 1); cx.fillRect(a, b + d - 1, c, 1);
+    cx.fillRect(a, b, 1, d); cx.fillRect(a + c - 1, b, 1, d);
+  }
+  cx.fillStyle = '#d8dce8';                     // corner posts
+  for (const p of [[x - 8, y - 8], [x + w + 2, y - 8], [x - 8, y + h + 2], [x + w + 2, y + h + 2]])
+    cx.fillRect(p[0], p[1], 6, 6);
+}
+
+function brief() {
+  cx.fillStyle = 'rgba(4,2,12,.9)'; cx.fillRect(0, 0, W, H);
+  panel(56, 26, 368, 214, '#4a5570');
+  txt('OHS PERSONNEL FILE', CX, 36, 1, '#8f8fb0', 1);
+  cx.fillStyle = '#2a3048'; cx.fillRect(72, 48, 336, 1);
+
+  spr(OFFICER, 118, 232, 3);
+  const L = BRIEF[page].split('|');
+  txt(L[0], 172, 96, 2, '#ffd23a', 0);
+  txt(L[1], 172, 124, 1, '#fff', 0);
+  txt(L[2], 172, 138, 1, '#9fe8ff', 0);
+
+  for (let i = 0; i < 3; i++) {                  // page dots
+    cx.fillStyle = i === page ? '#7dffc4' : '#39405a';
+    cx.fillRect(228 + i * 12, 206, 6, 4);
+  }
+  if ((t * 2 | 0) & 1) txt(MOB ? '[ TAP ]' : '[ ANY KEY ]', CX, 220, 1, '#7dffc4', 1);
+}
+
+function menu() {
+  // taller panel than the other cards: the logo needs the vertical room
+  cx.fillStyle = 'rgba(6,3,18,.86)'; cx.fillRect(56, 12, 368, 246);
+  neon(56, 12, 368, 246);
+  // drawn at integer scale 2 so it stays as crisp as everything else
+  spr(LOGO, CX, 152, 2);
+
+  if (MOB) {
+    txt('SWIPE LEFT / RIGHT TO CHANGE LANE', CX, 160, 1, '#fff', 1);
+    txt('[E] BUTTON  FIX THE HAZARD', CX, 173, 1, '#fff', 1);
+    txt('[B] BUTTON  SAFETY BRAKE', CX, 186, 1, '#fff', 1);
+    txt('HOLD THE BRAKE FOR MORE TIME TO WORK', CX, 199, 1, '#8f8fb0', 1);
+  } else {
+    let x = 180;                                 // each control row is pre-centred
+    x += key('<', x, 159) + 3; x += key('>', x, 159) + 5;
+    x += txt('/', x, 160, 1, '#8f8fb0', 0) + 5;
+    x += key('A', x, 159) + 3; x += key('D', x, 159) + 6;
+    txt('MOVE LANE', x, 160, 1, '#fff', 0);
+
+    x = 185;
+    x += key('SPACE', x, 172) + 6;
+    txt('SAFETY BRAKE', x, 173, 1, '#fff', 0);
+
+    x = 140;
+    x += key('E', x, 185) + 6;
+    txt('CLEAN / REMOVE / REPAIR / SIGNAL', x, 186, 1, '#fff', 0);
+
+    x = 196;
+    x += key('W', x, 198) + 4;
+    x += txt('BOOST', x, 199, 1, '#8f8fb0', 0) + 8;
+    x += key('M', x, 198) + 4;
+    txt('MUTE', x, 199, 1, '#8f8fb0', 0);
+  }
+
+  txt('DODGING KEEPS YOU ALIVE. FIXING KEEPS YOU EMPLOYED.', CX, 216, 1, '#9fe8ff', 1);
+  if ((t * 2 | 0) & 1) txt(MOB ? '[ TAP TO START ]' : '[ PRESS ANY KEY TO START ]', CX, 232, 1, '#7dffc4', 1);
+  if (best) txt('BEST ' + best, CX, 246, 1, '#8f8fb0', 1);
+}
+
+function report() {
+  cx.fillStyle = 'rgba(4,2,12,.92)'; cx.fillRect(0, 0, W, H);
+  // SAFETY is the same rolling average shown live all through the run — the
+  // grade below is exactly the number you were watching, not a separate stat
+  // computed only at the end.
+  const b = bandIdx(safety);
+  panel(CX - 120, 14, 240, 244, '#4a4f6a');
+  txt('SAFETY REPORT', CX, 22, 2, '#fff', 1);
+  cx.fillStyle = '#4a4f6a'; cx.fillRect(CX - 104, 38, 208, 1);
+  const L = [['DISTANCE', (dist | 0) + 'M'], ['HAZARDS', seen], ['REMOVED', mit], ['IGNORED', ign],
+  ['BOXES RESTOCKED', boxed], ['ACCIDENTS', acc], ['BEST COMBO', 'X' + bestCombo],
+  ['SAFETY', (safety | 0) + '%'], ['SCORE', score | 0]];
+  L.forEach((r, i) => {                          // 11px pitch keeps nine rows clear of the rule
+    const y = 46 + i * 11;
+    txt(r[0], CX - 104, y, 1, '#8f8fb0', 0);
+    txt(r[1], CX + 104, y, 1, '#fff', 2);
+  });
+  cx.fillStyle = '#4a4f6a'; cx.fillRect(CX - 104, 145, 208, 1);
+  txt('OHS RATING', CX, 151, 1, '#8f8fb0', 1);
+  for (let i = 0; i < 5; i++) txt('*', CX - 42 + i * 18, 163, 2, i <= b ? '#ffd23a' : '#3d3628', 0);
+  txt(RANK[b], CX, 185, 2, b > 2 ? '#3ef08a' : b > 0 ? '#ffd23a' : '#ff4646', 1);
+  txt(RMSG[b], CX, 203, 1, '#9fe8ff', 1);
+  if ((t * 2 | 0) & 1) txt(MOB ? '[ TAP TO RETRY ]' : '[ PRESS ANY KEY TO RETRY ]', CX, 232, 1, '#7dffc4', 1);
+}
+
+// ================================================================ FRAME
+const SCANP = (() => {
+  const c = document.createElement('canvas'); c.width = 1; c.height = 3;
+  const g = c.getContext('2d'); g.fillStyle = 'rgba(0,0,0,.22)'; g.fillRect(0, 2, 1, 1);
+  return dc.createPattern(c, 'repeat');
+})();
+const VIG = (() => {
+  const g = dc.createRadialGradient(480, 270, 200, 480, 270, 620);
+  g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,.62)');
+  return g;
+})();
+
+function draw() {
+  cx.setTransform(1, 0, 0, 1, 0, 0);
+  bg();
+  if (shk > .3) cx.translate(Math.round((Math.random() - .5) * shk), Math.round((Math.random() - .5) * shk));
+  road();
+  fog();
+  for (let i = hz.length; i--;) hazard(hz[i]);
+  if (st === 1) car();
+  for (const p of par) {
+    cx.fillStyle = 'hsl(' + p.h + ',100%,' + (p.l > .3 ? 68 : 44) + '%)';
+    cx.fillRect(p.x | 0, p.y | 0, p.r, p.r);
+  }
+  cx.setTransform(1, 0, 0, 1, 0, 0);
+  if (braking) { cx.fillStyle = 'rgba(80,160,255,.1)'; cx.fillRect(0, 0, W, H); }
+  if (st === 3) brief(); else if (st === 0) menu();
+  else if (st === 1) { hud(); if (incident >= 0) incidentCard(); } else report();
+
+  dc.drawImage(cv, 0, 0, 960, 540);
+  dc.fillStyle = SCANP; dc.fillRect(0, 0, 960, 540);
+  dc.fillStyle = VIG; dc.fillRect(0, 0, 960, 540);
+}
+
+//DBG window.__forceRacer = () => { hz.push({ t: RACER, lane: Math.random() * 3 | 0, z: SPZ + 70, d: 0 }); evK = 4; evMsg = 2.6; };
+//DBG window.__forceBomb = l => hz.push({ t: 5, lane: l, z: PLZ + 4, d: 0 });
+//DBG window.__forceBoxes = () => { hz = hz.filter(h => h.t < BOX); spawnBoxes(); };
+//DBG window.__dbg = () => ({ st, lane, dist: dist | 0, spd: +spd.toFixed(2), diff: +diff.toFixed(2), safety: +safety.toFixed(1), score: score | 0, combo, bestCombo, brk: +brk.toFixed(2), insp, incident, evK, evN, seen, mit, ign, acc, boxed, shield, mush: +mush.toFixed(2), inv: +inv.toFixed(2), hz: hz.map(h => [h.lane, +((h.z - PLZ) / (spd * SPU)).toFixed(3), h.t, h.d]) });
+
+// ---------------------------------------------------------------- loop
+let last = 0;
+function frame(now) {
+  const dt = Math.min(.05, (now - last) / 1000) || 0;
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
