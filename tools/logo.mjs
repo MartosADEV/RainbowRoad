@@ -8,6 +8,11 @@
 //
 // Usage:  node tools/logo.mjs            (survey sizes/palettes, measure cost)
 //         node tools/logo.mjs 128 12     (emit the chosen width + colour count)
+//
+// REQUIRES logo.png in the repo root. That source art is NOT committed, so this
+// tool cannot run on a fresh clone — the generated src/logo.js is committed
+// instead and the build only needs that. Drop the original PNG back in the root
+// if you ever want to re-derive the logo at a different size or palette.
 import { readFileSync, writeFileSync } from 'fs';
 import { inflateSync, deflateRawSync } from 'zlib';
 

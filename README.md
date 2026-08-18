@@ -133,6 +133,10 @@ node tools/logo.mjs 112 12   # emit src/logo.js at the chosen size
 `build.mjs` splices `src/logo.js` in at the `//LOGO` marker, so `game.js` stays readable and the
 logo can be re-derived at any size without hand-editing.
 
+**The source `logo.png` is not in the repo** — only the generated `src/logo.js` is, which is all
+`build.mjs` needs. `tools/logo.mjs` will fail without it; put the original PNG back in the repo
+root first if you want a different size or palette.
+
 **Why not embed the PNG.** A PNG is already DEFLATE-compressed, so the jam zip cannot squeeze it
 further — measured, a base64 PNG costs ~1.01x its own bytes, which capped the artwork at ~2.8 kB
 and would have consumed the entire remaining budget. The same image as a palette-index string
